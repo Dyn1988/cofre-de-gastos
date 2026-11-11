@@ -249,10 +249,16 @@ body.dragging{cursor:grabbing;user-select:none;-webkit-user-select:none}
     <svg class="gicon" viewBox="0 0 64 64" aria-hidden="true"><rect x="6" y="8" width="52" height="48" rx="8" fill="var(--safe)" stroke="var(--safe-edge)" stroke-width="3"/><circle cx="32" cy="32" r="13" fill="var(--brass)" stroke="var(--brass-ink)" stroke-width="2"/><circle cx="32" cy="32" r="3.5" fill="var(--brass-ink)"/><path d="M32 19v7M32 38v7M19 32h7M38 32h7" stroke="var(--brass-ink)" stroke-width="2.5" stroke-linecap="round" fill="none"/></svg>
     <h2 id="gt">Cofre de Gastos</h2>
     <p class="gdesc">Gastos de CPF e CNPJ por mês, com histórico, pagamentos e cofre de entrada.</p>
-    <div class="gacct" id="gAcct"></div>
-    <button class="btn" id="gEnter" type="button" disabled>Entrar</button>
-    <button class="ghost" id="gLocal" type="button" hidden>Continuar sem conta neste navegador</button>
-    <p class="gnote" id="gNote"></p>
+    <div class="gacct" id="gAcct">
+      <label for="authEmail">E-mail</label>
+      <input id="authEmail" type="email" autocomplete="email" placeholder="seu@email.com">
+      <label for="authPassword">Senha</label>
+      <input id="authPassword" type="password" autocomplete="current-password" placeholder="Mínimo de 6 caracteres">
+    </div>
+    <button class="btn" id="gEnter" type="button">Entrar</button>
+    <button class="ghost" id="gSignup" type="button">Criar conta</button>
+    <p class="gmsg" id="gMsg" role="status"></p>
+    <p class="gnote" id="gNote">Entre com seu e-mail e senha para acessar seus cofres.</p>
   </div>
   <footer class="copy">© <span class="yr"></span> Todos os direitos reservados a Douglas A. Wiederkehr.</footer>
 </div>
@@ -266,9 +272,12 @@ body.dragging{cursor:grabbing;user-select:none;-webkit-user-select:none}
       <button class="ghost" id="mToday" type="button" hidden>Ir para o mês atual</button>
     </nav>
     <div class="who">
-      <img class="av" id="av" alt="" width="36" height="36" hidden>
       <div class="wt"><b id="whoName">Sem login</b><span class="wm" id="whoMail"></span><span id="sync" data-s="local"></span></div>
+      <select id="workspaceSelect" aria-label="Selecionar cofre" style="width:auto;max-width:220px;padding:8px"></select>
+      <button class="ghost" id="createFamily" type="button">Criar familiar</button>
+      <button class="ghost" id="joinFamily" type="button">Entrar com convite</button>
       <button class="ghost" id="exp" type="button" hidden>Exportar backup</button>
+      <button class="ghost" id="signOut" type="button">Sair</button>
       <span id="expNote" role="status"></span>
     </div>
   </div>
@@ -407,6 +416,7 @@ body.dragging{cursor:grabbing;user-select:none;-webkit-user-select:none}
   <footer class="copy">© <span class="yr"></span> Todos os direitos reservados a Douglas A. Wiederkehr.</footer>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
 'use strict';
@@ -460,103 +470,186 @@ function loadLocal(){
   }
   return null;
 }
-var state=loadLocal()||seedState();
+function emptyState(){return {vault:{balance:0,exploded:false,log:[]},months:{}}}
+var state=loadLocal()||emptyState();
 var cur=monthKey();
 function tix(){return state.months[cur]||(state.months[cur]=[])}
 function setTix(a){state.months[cur]=a}
 
-/* ---------- persistência: conta > meses > tickets ---------- */
-var ref=null,mref=null,saveTimer=null,writing=false,pendingW=false,dirtyM={},dirtyV=false,syncState='local';
-var SYNC={ok:'Backup salvo nesta conta',saving:'Salvando…',error:'Não foi possível salvar na conta. Os dados continuam neste navegador.',local:'Sem login: dados salvos só neste navegador'};
-function isDirty(){return dirtyV||Object.keys(dirtyM).length>0}
-function persistLocal(){try{localStorage.setItem(storeKey,JSON.stringify(state))}catch(e){}}
+/* ---------- Supabase: autenticação, cofres e sincronização ---------- */
+var SUPABASE_URL='https://ocmzaxkznguthwfwhkhu.supabase.co';
+var SUPABASE_KEY='sb_publishable_yh4sJZdeUGbduH2oWmeQow_ISTc5xTl';
+var sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+var currentUser=null,currentWorkspace=null,families=[],channel=null;
+var saveTimer=null,writing=false,pendingW=false,dirty=false,syncState='local';
+var acctEmail='';
+var acct={state:'loading'};
+var SYNC={ok:'Sincronizado',saving:'Salvando…',error:'Falha ao sincronizar. Dados mantidos neste navegador.',local:'Somente neste navegador'};
 function setSync(st){syncState=st;var el=$('sync');if(el){el.textContent=SYNC[st]||'';el.dataset.s=st}}
-function save(what){
-  if(what==='vault')dirtyV=true;else dirtyM[cur]=true;
-  persistLocal();
-  if(!mref){setSync('local');return}
-  pendingW=true;setSync('saving');clearTimeout(saveTimer);saveTimer=setTimeout(flush,350);
+function workspaceKey(w){return KEY+':'+(w.type==='family'?'family:'+w.id:'user:'+w.id)}
+function persistLocal(){if(!currentWorkspace)return;try{localStorage.setItem(workspaceKey(currentWorkspace),JSON.stringify(state))}catch(e){}}
+function save(){
+  dirty=true;persistLocal();
+  if(!currentWorkspace){setSync('local');return}
+  pendingW=true;setSync('saving');clearTimeout(saveTimer);saveTimer=setTimeout(flush,500);
 }
-function flush(){
-  if(writing){saveTimer=setTimeout(flush,200);return}
+async function flush(){
+  if(!currentWorkspace||!currentUser)return;
+  if(writing){saveTimer=setTimeout(flush,250);return}
   writing=true;pendingW=false;
-  var ms=Object.keys(dirtyM),v=dirtyV;dirtyM={};dirtyV=false;
-  Promise.resolve().then(function(){
-    return Promise.all(ms.map(function(k){return mref.doc(k).set({tickets:clone(state.months[k]||[])})}));
-  }).then(function(){
-    return v?ref.set({v:2,vault:clone(state.vault)}):null;
-  }).then(function(){
-    setSync(pendingW||isDirty()?'saving':'ok');
-  }).catch(function(){
-    ms.forEach(function(k){dirtyM[k]=true});if(v)dirtyV=true;setSync('error');
-  }).then(function(){writing=false});
+  var snapshot=clone(state),w=currentWorkspace;
+  try{
+    var table=w.type==='family'?'family_data':'user_data';
+    var key=w.type==='family'?'family_id':'user_id';
+    var payload={};payload[key]=w.id;payload.state=snapshot;payload.updated_at=new Date().toISOString();
+    var result=await sb.from(table).upsert(payload,{onConflict:key});
+    if(result.error)throw result.error;
+    dirty=false;setSync('ok');
+  }catch(e){dirty=true;setSync('error');}
+  finally{writing=false;if(pendingW||dirty){clearTimeout(saveTimer);saveTimer=setTimeout(flush,500)}}
 }
-function docsToMonths(snap){
-  var m={};
-  snap.docs.forEach(function(d){var x=d.data();if(x&&Array.isArray(x.tickets)&&/^\d{4}-\d{2}$/.test(d.id))m[d.id]=clone(x.tickets)});
-  return m;
-}
-function markAllDirty(){Object.keys(state.months).forEach(function(k){dirtyM[k]=true});dirtyV=true}
-var acct={state:'loading'},acctEmail='';
-function showWho(me){
-  acctEmail=me.email||'';
-  $('whoName').textContent=me.name||'Sua conta';
+function docsToMonths(){return {}}
+function markAllDirty(){dirty=true}
+function showWho(user){
+  acctEmail=user.email||'';
+  $('whoName').textContent=(user.user_metadata&&user.user_metadata.full_name)||acctEmail||'Conta';
   $('whoMail').textContent=acctEmail;
-  if(me.avatarUrl){var a=$('av');a.src=me.avatarUrl;a.hidden=false}
-  acct={state:'ok',name:me.name||'',email:acctEmail,avatar:me.avatarUrl||''};
-  renderGate();
+  acct={state:'ok',name:$('whoName').textContent,email:acctEmail};
 }
-function noAcct(){acct={state:'none'};renderGate()}
-function initDb(){
-  if(!window.claude||!claude.use){noAcct();return}
-  Promise.all([claude.use('db'),claude.use('user')]).then(function(r){
-    var db=r[0],user=r[1];
-    if(!db||!user){noAcct();return}
-    return user.me().then(function(me){
-      if(!me||!me.id){noAcct();return}
-      showWho(me);
-      return connect(db,me.id);
-    });
-  }).catch(function(){setSync('local');if(acct.state!=='ok')noAcct()});
+function renderGate(){}
+function openApp(){
+  $('gate').hidden=true;document.querySelector('.page').inert=false;
+  try{sessionStorage.setItem('cofre-gate','1')}catch(e){}
 }
-function connect(db,id){
-  storeKey=KEY+':'+id;
-  var app=db.doc('data/users/'+id+'/app'),mcol=app.collection('months');
-  return Promise.all([app.get(),mcol.get()]).then(function(r){
-    var a=r[0],mm=docsToMonths(r[1]),nm=Object.keys(mm).length;
-    if(a.exists){
-      var d=a.data()||{};
-      var vault=d.vault&&typeof d.vault.balance==='number'?clone(d.vault):{balance:0,exploded:false,log:[]};
-      if(Array.isArray(d.tickets)){
-        /* formato antigo: os tickets soltos viram os gastos do mês atual */
-        if(!mm[monthKey()])mm[monthKey()]=clone(d.tickets);
-        state=normalize({vault:vault,months:mm});markAllDirty();
-      }else state=normalize({vault:vault,months:mm});
-    }else if(nm){
-      state=normalize({vault:state.vault,months:mm});dirtyV=true;
-    }else{
-      markAllDirty(); /* conta nova: leva os dados deste navegador para a conta */
+function showGateMessage(message){var m=$('gMsg');if(m)m.textContent=message}
+function stopRealtime(){if(channel){sb.removeChannel(channel);channel=null}}
+function watchWorkspace(){
+  stopRealtime();if(!currentWorkspace)return;
+  var w=currentWorkspace,table=w.type==='family'?'family_data':'user_data';
+  var key=w.type==='family'?'family_id':'user_id';
+  channel=sb.channel('cofre-'+w.type+'-'+w.id)
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:table,filter:key+'=eq.'+w.id},function(payload){
+      if(writing||dirty||!payload.new||!payload.new.state)return;
+      var incoming=payload.new.state;
+      if(JSON.stringify(incoming)!==JSON.stringify(state)){
+        state=normalize(incoming);persistLocal();renderAll();setSync('ok');
+      }
+    }).subscribe();
+}
+async function fetchWorkspace(w){
+  var table=w.type==='family'?'family_data':'user_data';
+  var key=w.type==='family'?'family_id':'user_id';
+  var res=await sb.from(table).select('state').eq(key,w.id).maybeSingle();
+  if(res.error)throw res.error;
+  return res.data&&validState(res.data.state)?normalize(res.data.state):null;
+}
+async function switchWorkspace(type,id,name){
+  if(saveTimer)clearTimeout(saveTimer);
+  if(dirty&&currentWorkspace)await flush();
+  stopRealtime();
+  var w={type:type,id:id,name:name|| (type==='family'?'Cofre Familiar':'Meu cofre')};
+  setSync('saving');
+  try{
+    var remote=await fetchWorkspace(w);
+    if(remote){state=remote}
+    else{
+      var legacy=readLocal(KEY+':anon')||readLocal(KEY+':'+id);
+      if(legacy&&validState(legacy)&&confirm('Encontramos dados antigos salvos neste navegador. Deseja importar esses dados para '+w.name+'?')){
+        state=normalize(legacy);
+      }else{
+        var local=readLocal(workspaceKey(w));
+        state=local&&validState(local)?normalize(local):emptyState();
+      }
+      currentWorkspace=w;dirty=true;persistLocal();await flush();
     }
-    ref=app;mref=mcol;persistLocal();renderAll();
-    if(isDirty()){pendingW=true;setSync('saving');flush()}else setSync('ok');
-    watch(app,mcol);
+    currentWorkspace=w;persistLocal();cur=monthKey();renderAll();watchWorkspace();setSync('ok');
+    $('workspaceSelect').value=type==='family'?'family:'+id:'user';
+    $('createFamily').hidden=false;$('joinFamily').hidden=false;
+  }catch(e){
+    currentWorkspace=w;
+    var local=readLocal(workspaceKey(w));
+    state=local&&validState(local)?normalize(local):emptyState();
+    cur=monthKey();renderAll();setSync('error');
+    showGateMessage('Não foi possível carregar o cofre na nuvem. Verifique sua conexão e tente novamente.');
+  }
+}
+async function refreshFamilies(){
+  families=[];
+  var r=await sb.from('family_members').select('family_id,role').eq('user_id',currentUser.id);
+  if(r.error)throw r.error;
+  var ids=(r.data||[]).map(function(x){return x.family_id});
+  if(ids.length){
+    var spaces=await sb.from('family_spaces').select('id,name,invite_code').in('id',ids);
+    if(spaces.error)throw spaces.error;
+    families=spaces.data||[];
+  }
+  var sel=$('workspaceSelect');sel.replaceChildren();
+  var own=document.createElement('option');own.value='user';own.textContent='Meu cofre';sel.append(own);
+  families.forEach(function(f){var o=document.createElement('option');o.value='family:'+f.id;o.textContent=f.name||'Cofre Familiar';sel.append(o)});
+}
+async function createFamily(){
+  var name=prompt('Nome do cofre familiar:','Cofre Familiar');if(name===null)return;
+  var r=await sb.rpc('create_family',{p_name:name.trim()||'Cofre Familiar'});
+  if(r.error){alert('Não foi possível criar o cofre: '+r.error.message);return}
+  var row=Array.isArray(r.data)?r.data[0]:r.data;
+  if(!row||!row.family_id){alert('O Supabase não retornou os dados do cofre.');return}
+  await refreshFamilies();
+  var f=families.find(function(x){return x.id===row.family_id});
+  await switchWorkspace('family',row.family_id,f&&f.name||name);
+  alert('Cofre familiar criado. Código de convite: '+row.invite_code+'\nGuarde e envie esse código para sua esposa.');
+}
+async function joinFamily(){
+  var code=prompt('Digite o código de convite do cofre familiar:');if(!code)return;
+  var r=await sb.rpc('join_family',{p_invite_code:code.trim()});
+  if(r.error){alert('Não foi possível entrar no cofre: '+r.error.message);return}
+  await refreshFamilies();
+  var id=r.data, f=families.find(function(x){return x.id===id});
+  await switchWorkspace('family',id,f&&f.name||'Cofre Familiar');
+  alert('Você entrou no cofre familiar.');
+}
+async function initAuth(){
+  if(!window.supabase||!window.supabase.createClient){showGateMessage('Não foi possível carregar o serviço de login. Atualize a página.');return}
+  $('gEnter').addEventListener('click',async function(){
+    var email=$('authEmail').value.trim(),password=$('authPassword').value;
+    if(!email||!password){showGateMessage('Informe e-mail e senha.');return}
+    showGateMessage('Entrando…');
+    var r=await sb.auth.signInWithPassword({email:email,password:password});
+    if(r.error){showGateMessage('Não foi possível entrar: '+r.error.message);return}
+    await onAuthenticated(r.data.user);
+  });
+  $('gSignup').addEventListener('click',async function(){
+    var email=$('authEmail').value.trim(),password=$('authPassword').value;
+    if(!email||password.length<6){showGateMessage('Informe um e-mail válido e uma senha com pelo menos 6 caracteres.');return}
+    showGateMessage('Criando sua conta…');
+    var r=await sb.auth.signUp({email:email,password:password});
+    if(r.error){showGateMessage('Não foi possível criar a conta: '+r.error.message);return}
+    if(!r.data.session){showGateMessage('Conta criada. Confira seu e-mail para confirmar o cadastro e depois entre.');return}
+    await onAuthenticated(r.data.user);
+  });
+  $('signOut').addEventListener('click',async function(){await sb.auth.signOut();stopRealtime();currentUser=null;currentWorkspace=null;$('gate').hidden=false;document.querySelector('.page').inert=true;showGateMessage('Você saiu da sua conta.')});
+  $('createFamily').addEventListener('click',function(){createFamily().catch(function(e){alert('Erro: '+e.message)})});
+  $('joinFamily').addEventListener('click',function(){joinFamily().catch(function(e){alert('Erro: '+e.message)})});
+  $('workspaceSelect').addEventListener('change',function(){
+    var v=this.value;
+    if(v==='user')switchWorkspace('user',currentUser.id,'Meu cofre');
+    else{var id=v.slice(7),f=families.find(function(x){return x.id===id});switchWorkspace('family',id,f&&f.name||'Cofre Familiar')}
+  });
+  var s=await sb.auth.getSession();
+  if(s.error){showGateMessage('Não foi possível verificar sua sessão.');return}
+  if(s.data.session)await onAuthenticated(s.data.session.user);
+  else{document.querySelector('.page').inert=true;$('gate').hidden=false}
+  sb.auth.onAuthStateChange(function(event,session){
+    if(event==='SIGNED_OUT'){stopRealtime();currentUser=null;currentWorkspace=null;$('gate').hidden=false;document.querySelector('.page').inert=true}
   });
 }
-function watch(app,mcol){
-  app.onSnapshot(function(s){
-    if(s.metadata.hasPendingWrites||pendingW||writing||isDirty()||drag||busy||!s.exists)return;
-    var d=s.data();if(!d||!d.vault||Array.isArray(d.tickets))return;
-    var v=clone(d.vault);if(!Array.isArray(v.log))v.log=[];
-    if(JSON.stringify(v)!==JSON.stringify(state.vault)){state.vault=v;persistLocal();renderVault();renderHistory()}
-  },function(){});
-  mcol.onSnapshot(function(s){
-    if(s.metadata.hasPendingWrites||pendingW||writing||isDirty()||drag)return;
-    var mm=docsToMonths(s),ch=false;
-    Object.keys(mm).forEach(function(k){if(JSON.stringify(mm[k])!==JSON.stringify(state.months[k])){state.months[k]=mm[k];ch=true}});
-    if(ch){persistLocal();renderMonth()}
-  },function(){});
+async function onAuthenticated(user){
+  currentUser=user;showWho(user);
+  try{
+    await refreshFamilies();
+    await switchWorkspace('user',user.id,'Meu cofre');
+    openApp();
+  }catch(e){showGateMessage('Login realizado, mas não foi possível carregar seus cofres: '+e.message)}
 }
-
 /* ---------- utilidades ---------- */
 function parseBRL(s){
   s=String(s).replace(/[R$\s]/g,'');if(!s)return NaN;
@@ -784,16 +877,14 @@ function bindNav(){
   $('mPrev').addEventListener('click',function(){setMonth(shiftMonth(cur,-1))});
   $('mNext').addEventListener('click',function(){setMonth(shiftMonth(cur,1))});
   $('mToday').addEventListener('click',function(){setMonth(monthKey())});
-  if(window.claude&&claude.use)claude.use('downloads').then(function(dl){
-    if(!dl)return;
-    var b=$('exp');b.hidden=false;
-    b.addEventListener('click',function(){
-      var data=JSON.stringify({app:'cofre-de-gastos',versao:2,exportadoEm:new Date().toISOString(),conta:acctEmail||null,cofre:state.vault,meses:state.months},null,2);
-      dl.save({filename:'cofre-de-gastos-'+dayKey()+'.json',data:data})
-        .then(function(){note('Backup salvo.')})
-        .catch(function(e){if(!e||e.code!=='declined')note('Não foi possível salvar o backup.')});
-    });
-  }).catch(function(){});
+  var b=$('exp');b.hidden=false;
+  b.addEventListener('click',function(){
+    var data=JSON.stringify({app:'cofre-de-gastos',versao:2,exportadoEm:new Date().toISOString(),conta:acctEmail||null,cofre:state.vault,meses:state.months},null,2);
+    var blob=new Blob([data],{type:'application/json'});
+    var url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download='cofre-de-gastos-'+dayKey()+'.json';a.click();
+    setTimeout(function(){URL.revokeObjectURL(url)},1000);note('Backup exportado.');
+  });
 }
 
 /* tela de entrada */
@@ -1023,10 +1114,9 @@ $('vReset').addEventListener('click',function(){
 /* ---------- início ---------- */
 renderAll();
 requestAnimationFrame(function(){requestAnimationFrame(function(){$('vsvg').classList.add('ready');document.body.classList.add('ready')})});
-initGate();
 bindNav();
 setSync('local');
-initDb();
+initAuth().catch(function(e){showGateMessage('Erro ao iniciar: '+e.message)});
 })();
 </script>
 
