@@ -479,7 +479,7 @@ function setTix(a){state.months[cur]=a}
 /* ---------- Supabase: autenticação, cofres e sincronização ---------- */
 var SUPABASE_URL='https://ocmzaxkznguthwfwhkhu.supabase.co';
 var SUPABASE_KEY='sb_publishable_yh4sJZdeUGbduH2oWmeQow_ISTc5xTl';
-var sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+var sb=null;
 var currentUser=null,currentWorkspace=null,families=[],channel=null;
 var saveTimer=null,writing=false,pendingW=false,dirty=false,syncState='local';
 var acctEmail='';
@@ -504,9 +504,9 @@ async function flush(){
     var payload={};payload[key]=w.id;payload.state=snapshot;payload.updated_at=new Date().toISOString();
     var result=await sb.from(table).upsert(payload,{onConflict:key});
     if(result.error)throw result.error;
-    dirty=false;setSync('ok');
-  }catch(e){dirty=true;setSync('error');}
-  finally{writing=false;if(pendingW||dirty){clearTimeout(saveTimer);saveTimer=setTimeout(flush,500)}}
+    dirty=false;setSync('ok');return true;
+  }catch(e){dirty=true;setSync('error');return false;}
+  finally{writing=false;if(pendingW||dirty){clearTimeout(saveTimer);saveTimer=setTimeout(flush,1500)}}
 }
 function docsToMonths(){return {}}
 function markAllDirty(){dirty=true}
@@ -528,7 +528,7 @@ function watchWorkspace(){
   var w=currentWorkspace,table=w.type==='family'?'family_data':'user_data';
   var key=w.type==='family'?'family_id':'user_id';
   channel=sb.channel('cofre-'+w.type+'-'+w.id)
-    .on('postgres_changes',{event:'UPDATE',schema:'public',table:table,filter:key+'=eq.'+w.id},function(payload){
+    .on('postgres_changes',{event:'*',schema:'public',table:table,filter:key+'=eq.'+w.id},function(payload){
       if(writing||dirty||!payload.new||!payload.new.state)return;
       var incoming=payload.new.state;
       if(JSON.stringify(incoming)!==JSON.stringify(state)){
@@ -562,7 +562,7 @@ async function switchWorkspace(type,id,name){
       }
       currentWorkspace=w;dirty=true;persistLocal();await flush();
     }
-    currentWorkspace=w;persistLocal();cur=monthKey();renderAll();watchWorkspace();setSync('ok');
+    currentWorkspace=w;persistLocal();cur=monthKey();renderAll();watchWorkspace();if(remote)setSync('ok');
     $('workspaceSelect').value=type==='family'?'family:'+id:'user';
     $('createFamily').hidden=false;$('joinFamily').hidden=false;
   }catch(e){
@@ -609,6 +609,7 @@ async function joinFamily(){
 }
 async function initAuth(){
   if(!window.supabase||!window.supabase.createClient){showGateMessage('Não foi possível carregar o serviço de login. Atualize a página.');return}
+  sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
   $('gEnter').addEventListener('click',async function(){
     var email=$('authEmail').value.trim(),password=$('authPassword').value;
     if(!email||!password){showGateMessage('Informe e-mail e senha.');return}
@@ -626,7 +627,7 @@ async function initAuth(){
     if(!r.data.session){showGateMessage('Conta criada. Confira seu e-mail para confirmar o cadastro e depois entre.');return}
     await onAuthenticated(r.data.user);
   });
-  $('signOut').addEventListener('click',async function(){await sb.auth.signOut();stopRealtime();currentUser=null;currentWorkspace=null;$('gate').hidden=false;document.querySelector('.page').inert=true;showGateMessage('Você saiu da sua conta.')});
+  $('signOut').addEventListener('click',async function(){await sb.auth.signOut();stopRealtime();currentUser=null;currentWorkspace=null;families=[];state=emptyState();renderAll();$('whoName').textContent='Sem login';$('whoMail').textContent='';$('gate').hidden=false;document.querySelector('.page').inert=true;showGateMessage('Você saiu da sua conta.')});
   $('createFamily').addEventListener('click',function(){createFamily().catch(function(e){alert('Erro: '+e.message)})});
   $('joinFamily').addEventListener('click',function(){joinFamily().catch(function(e){alert('Erro: '+e.message)})});
   $('workspaceSelect').addEventListener('change',function(){
@@ -639,7 +640,7 @@ async function initAuth(){
   if(s.data.session)await onAuthenticated(s.data.session.user);
   else{document.querySelector('.page').inert=true;$('gate').hidden=false}
   sb.auth.onAuthStateChange(function(event,session){
-    if(event==='SIGNED_OUT'){stopRealtime();currentUser=null;currentWorkspace=null;$('gate').hidden=false;document.querySelector('.page').inert=true}
+    if(event==='SIGNED_OUT'){stopRealtime();currentUser=null;currentWorkspace=null;families=[];state=emptyState();renderAll();$('whoName').textContent='Sem login';$('whoMail').textContent='';$('gate').hidden=false;document.querySelector('.page').inert=true}
   });
 }
 async function onAuthenticated(user){
